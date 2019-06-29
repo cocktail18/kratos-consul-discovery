@@ -10,7 +10,6 @@ import (
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/api/watch"
 	llog "log"
-	"math/rand"
 	"net/url"
 	"os"
 	"strconv"
@@ -94,7 +93,10 @@ func (resolver Resolver) fetch(c context.Context) (*naming.InstancesInfo, bool) 
 	instancesInfo.Instances = make(map[string][]*naming.Instance)
 	log.Info("get AgentHealthServiceByName %s info len %d", resolver.appID, len(infoArr))
 	for _, info := range infoArr {
-		log.Info("get AgentHealthServiceByName %s info addr %s:%d", resolver.appID, info.Service.Address, info.Service.Port)
+		log.Info("get AgentHealthServiceByName %s info addr %s:%d status: %s", resolver.appID, info.Service.Address, info.Service.Port, info.AggregatedStatus)
+		if info.AggregatedStatus != "passing" {
+			continue
+		}
 		ins := resolver.coverService2Instance(info.Service)
 		if _, ok := instancesInfo.Instances[ins.Zone]; !ok {
 			instancesInfo.Instances[ins.Zone] = make([]*naming.Instance, 0, 10)
@@ -105,12 +107,11 @@ func (resolver Resolver) fetch(c context.Context) (*naming.InstancesInfo, bool) 
 	return instancesInfo, true
 }
 func (resolver Resolver) Fetch(c context.Context) (ins *naming.InstancesInfo, ok bool) {
-	ins, ok = resolver.node.Load().(*naming.InstancesInfo)
-	return
+	return resolver.fetch(c)
 }
 
 func (resolver Resolver) Close() error {
-	if !resolver.plan.IsStopped() {
+	if resolver.plan != nil && !resolver.plan.IsStopped() {
 		resolver.plan.Stop()
 	}
 	return nil
@@ -130,12 +131,14 @@ func (resolver Resolver) coverService2Instance(service *api.AgentService) *namin
 		AppID:    service.Service,
 		Addrs:    addr,
 	}
-	delete(meta, "region")
-	delete(meta, "zone")
-	delete(meta, "env")
-	delete(meta, "hostname")
-	delete(meta, "version")
-	ins.Metadata = meta
+	ins.Metadata = make(map[string]string)
+	for key, value := range meta	 {
+		if key == "region" || key == "env" || key == "zone" || key == "version" || key =="hostname" {
+			continue
+		}
+		ins.Metadata[key] = value
+	}
+	ins.LastTs = time.Now().Unix()
 	return ins
 }
 
@@ -174,54 +177,6 @@ func (builder Builder) coverIns2AgentService(ins *naming.Instance) ([]*api.Agent
 	return registrationArr, nil
 }
 
-func (resolver *Resolver) selfproc() {
-	for {
-		_, ok := <-resolver.c
-		if !ok {
-			return
-		}
-		zones, ok := resolver.fetch(context.Background())
-		if ok {
-			resolver.newSelf(zones.Instances)
-		}
-	}
-}
-
-func (resolver *Resolver) newSelf(zones map[string][]*naming.Instance) {
-	ins, ok := zones[resolver.builder.c.Zone]
-	if !ok {
-		return
-	}
-	var nodes []string
-	for _, in := range ins {
-		for _, addr := range in.Addrs {
-			u, err := url.Parse(addr)
-			if err == nil && u.Scheme == "http" {
-				nodes = append(nodes, u.Host)
-			}
-		}
-	}
-	// diff old nodes
-	var olds int
-	for _, n := range nodes {
-		if node, ok := resolver.node.Load().([]string); ok {
-			for _, o := range node {
-				if o == n {
-					olds++
-					break
-				}
-			}
-		}
-	}
-	if len(nodes) == olds {
-		return
-	}
-	rand.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
-	})
-	resolver.node.Store(nodes)
-}
-
 func (builder Builder) Register(ctx context.Context, ins *naming.Instance) (cancel context.CancelFunc, err error) {
 	serviceArr, err := builder.coverIns2AgentService(ins)
 	if err != nil {
@@ -256,6 +211,7 @@ func (builder Builder) Register(ctx context.Context, ins *naming.Instance) (canc
 			for {
 				select {
 				case <-ctx.Done():
+					log.Info("ServiceDeregister %s", service.ID)
 					err := builder.agent.ServiceDeregister(service.ID)
 					if err != nil {
 						log.Error("consul: ServiceDeregister %s err: %s", service.ID, err.Error())
@@ -307,7 +263,7 @@ func (builder Builder) Build(id string) naming.Resolver {
 		log.Error("watch error %s", err.Error())
 	}
 	r.c <- struct {}{}
-	go r.selfproc()
+
 	return r
 }
 
