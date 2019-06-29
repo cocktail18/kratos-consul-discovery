@@ -54,8 +54,8 @@ func (resolver Resolver) watch() error {
 		return err
 	}
 	plan.Handler = func(idx uint64, raw interface{}) {
-		log.Info("watch notify %v", raw)
 		resolver.c <- struct{}{}
+		log.Info("watch notify")
 		if raw == nil {
 			return // ignore
 		}
@@ -67,8 +67,6 @@ func (resolver Resolver) watch() error {
 			log.Error(`v["consul"] == nil`)
 			return
 		}
-		log.Info("watch notify %v", v)
-		//resolver.c <- struct{}{}
 	}
 	logger := llog.New(os.Stdout, "", llog.LstdFlags) // @todo replace logger
 	go func() {
