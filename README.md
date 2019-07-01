@@ -2,7 +2,7 @@
 
 ## 项目简介
 1. Kratos  https://github.com/bilibili/kratos 的一个`discovery` 组件, 跟默认的 discovery 组件功能一样，只是使用了 consul 作为服务发现中心
-2. not ready for production
+
 
 ## demo
 
