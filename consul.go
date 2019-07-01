@@ -11,7 +11,6 @@ import (
 	"github.com/hashicorp/consul/api/watch"
 	llog "log"
 	"net/url"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -21,6 +20,15 @@ import (
 var (
 	ERR_INS_ADDRS_EMPTY = errors.New("len of ins.Addrs should not be 0")
 )
+
+type logWrapper struct{
+
+}
+
+func (wrapper logWrapper) Write(p []byte) (n int, err error){
+	log.Info(string(p))
+	return len(p), nil
+}
 
 // Config discovery configures.
 type Config struct {
@@ -39,10 +47,10 @@ type Resolver struct {
 	agent   *api.Agent
 	plan    *watch.Plan
 	builder *Builder
-	node    atomic.Value
+	ins    atomic.Value
 }
 
-func (resolver Resolver) watch() error {
+func (resolver *Resolver) watch() error {
 	var params map[string]interface{}
 	watchKey := fmt.Sprintf(`{"type":"service", "service":"%s"}`, resolver.appID)
 	if err := json.Unmarshal([]byte(watchKey), &params); err != nil {
@@ -53,21 +61,20 @@ func (resolver Resolver) watch() error {
 		return err
 	}
 	plan.Handler = func(idx uint64, raw interface{}) {
-		resolver.c <- struct{}{}
-		log.Info("watch notify")
 		if raw == nil {
 			return // ignore
 		}
-		v, ok := raw.(map[string][]string)
-		if !ok || len(v) == 0 {
+		v, ok := raw.([]*api.ServiceEntry)
+		if !ok {
 			return // ignore
 		}
-		if v["consul"] == nil {
-			log.Error(`v["consul"] == nil`)
-			return
-		}
+		log.Info("consul watch service %s notify, len %d", resolver.appID, len(v))
+		ins := resolver.coverServiceEntry2Ins(v)
+		resolver.ins.Store(ins)
+		resolver.c <- struct{}{}
 	}
-	logger := llog.New(os.Stdout, "", llog.LstdFlags) // @todo replace logger
+
+	logger := llog.New(&logWrapper{}, "", llog.LstdFlags) // replace logger
 	go func() {
 		err := plan.RunWithClientAndLogger(resolver.client, logger)
 		if err != nil {
@@ -78,18 +85,37 @@ func (resolver Resolver) watch() error {
 	return nil
 }
 
-func (resolver Resolver) Watch() <-chan struct{} {
+func (resolver *Resolver) Watch() <-chan struct{} {
 	return resolver.c
 }
 
-func (resolver Resolver) fetch(c context.Context) (*naming.InstancesInfo, bool) {
+func (resolver Resolver) coverServiceEntry2Ins(serviceArr []*api.ServiceEntry)(*naming.InstancesInfo){
+	instancesInfo := &naming.InstancesInfo{}
+	//instancesInfo.Scheduler = make([]naming.Zone, 0, 10)
+	instancesInfo.Instances = make(map[string][]*naming.Instance)
+	for _, service := range serviceArr {
+		if service.Checks.AggregatedStatus() == api.HealthPassing {
+			log.Info("appid %s ip %s port %d pass", resolver.appID, service.Service.Address, service.Service.Port)
+			ins := resolver.coverService2Instance(service.Service)
+			if _, ok := instancesInfo.Instances[ins.Zone]; !ok {
+				instancesInfo.Instances[ins.Zone] = make([]*naming.Instance, 0, 10)
+			}
+			instancesInfo.Instances[ins.Zone] = append(instancesInfo.Instances[ins.Zone], ins)
+		}
+	}
+	instancesInfo.LastTs = time.Now().Unix()
+	return instancesInfo
+}
+
+// unused
+func (resolver *Resolver) fetch(c context.Context) (*naming.InstancesInfo, bool) {
 	_, infoArr, err := resolver.agent.AgentHealthServiceByName(resolver.appID)
 	if err != nil {
 		log.Error("get AgentHealthServiceByName %s err %s", resolver.appID, err.Error())
 		return nil, false
 	}
 	instancesInfo := &naming.InstancesInfo{}
-	instancesInfo.Scheduler = make([]naming.Zone, 0, 10)
+	//instancesInfo.Scheduler = make([]naming.Zone, 0, 10)
 	instancesInfo.Instances = make(map[string][]*naming.Instance)
 	log.Info("get AgentHealthServiceByName %s info len %d", resolver.appID, len(infoArr))
 	for _, info := range infoArr {
@@ -106,8 +132,11 @@ func (resolver Resolver) fetch(c context.Context) (*naming.InstancesInfo, bool) 
 	instancesInfo.LastTs = time.Now().Unix()
 	return instancesInfo, true
 }
-func (resolver Resolver) Fetch(c context.Context) (ins *naming.InstancesInfo, ok bool) {
-	return resolver.fetch(c)
+
+func (resolver *Resolver) Fetch(c context.Context) (ins *naming.InstancesInfo, ok bool) {
+	v := resolver.ins.Load()
+	ins, ok = v.(*naming.InstancesInfo)
+	return
 }
 
 func (resolver Resolver) Close() error {
@@ -132,8 +161,8 @@ func (resolver Resolver) coverService2Instance(service *api.AgentService) *namin
 		Addrs:    addr,
 	}
 	ins.Metadata = make(map[string]string)
-	for key, value := range meta	 {
-		if key == "region" || key == "env" || key == "zone" || key == "version" || key =="hostname" {
+	for key, value := range meta {
+		if key == "region" || key == "env" || key == "zone" || key == "version" || key == "hostname" {
 			continue
 		}
 		ins.Metadata[key] = value
@@ -184,6 +213,11 @@ func (builder Builder) Register(ctx context.Context, ins *naming.Instance) (canc
 	}
 
 	ctx, cancel = context.WithCancel(ctx)
+	defer func() {
+		if err != nil { // avoid register partition
+			cancel()
+		}
+	}()
 	for _, service := range serviceArr { //@todo 批量注册
 		service.Check = &api.AgentServiceCheck{
 			TTL:    "15s",
@@ -262,8 +296,6 @@ func (builder Builder) Build(id string) naming.Resolver {
 	if err != nil {
 		log.Error("watch error %s", err.Error())
 	}
-	r.c <- struct {}{}
-
 	return r
 }
 
