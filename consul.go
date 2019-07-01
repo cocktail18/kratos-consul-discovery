@@ -12,6 +12,7 @@ import (
 	llog "log"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,11 +22,10 @@ var (
 	ERR_INS_ADDRS_EMPTY = errors.New("len of ins.Addrs should not be 0")
 )
 
-type logWrapper struct{
-
+type logWrapper struct {
 }
 
-func (wrapper logWrapper) Write(p []byte) (n int, err error){
+func (wrapper logWrapper) Write(p []byte) (n int, err error) {
 	log.Info(string(p))
 	return len(p), nil
 }
@@ -47,7 +47,7 @@ type Resolver struct {
 	agent   *api.Agent
 	plan    *watch.Plan
 	builder *Builder
-	ins    atomic.Value
+	ins     atomic.Value
 }
 
 func (resolver *Resolver) watch() error {
@@ -89,7 +89,7 @@ func (resolver *Resolver) Watch() <-chan struct{} {
 	return resolver.c
 }
 
-func (resolver Resolver) coverServiceEntry2Ins(serviceArr []*api.ServiceEntry)(*naming.InstancesInfo){
+func (resolver Resolver) coverServiceEntry2Ins(serviceArr []*api.ServiceEntry) (*naming.InstancesInfo) {
 	instancesInfo := &naming.InstancesInfo{}
 	//instancesInfo.Scheduler = make([]naming.Zone, 0, 10)
 	instancesInfo.Instances = make(map[string][]*naming.Instance)
@@ -253,8 +253,15 @@ func (builder Builder) Register(ctx context.Context, ins *naming.Instance) (canc
 					return
 				case <-time.After(time.Second * 5):
 					err := builder.agent.PassTTL(fmt.Sprintf("service:%s", service.ID), "I am good :)")
-					if err != nil {
-						log.Error("consul: ServiceRegister %s err: %s", service.ID, err.Error())
+					if err == nil {
+						continue
+					}
+					log.Error("consul: PassTTL %s err: %s", service.ID, err.Error())
+					if strings.Index(err.Error(), "does not have associated TTL") > 0 { // 注册已经失效
+						err = builder.agent.ServiceRegister(service) // consul 下线会导致 有这个 error
+						if err != nil {
+							log.Error("consul: PassTTL %s reRegister err: %s", service.ID, err.Error())
+						}
 					}
 				}
 			}
